@@ -7,6 +7,9 @@
       pip install -r requirements.txt
       streamlit run streamlit_app.py
 
+  The T-s diagram is drawn with Streamlit's native charting engine
+  (Altair / Vega-Lite) — fully interactive (hover, zoom, pan).
+
   Steam properties come from CoolProp (IAPWS-95 formulation), the same
   standard the published steam tables are built on. Differences from
   the textbook (<0.5%) are only due to table rounding.
@@ -19,21 +22,12 @@ CYCLE MODEL (6 states)
   4 : steam @ reheat pressure                   (HP-turbine exit, isentropic)
   5 : reheated steam    @ reheat pressure        (LP-turbine inlet)
   6 : wet steam         @ condenser pressure     (LP-turbine exit, isentropic)
-
-PROCESS RULES
-  1->2 pump       : isentropic  s2 = s1
-  2->3 boiler     : constant P  (liquid heating -> boiling -> superheat)
-  3->4 HP turbine : isentropic  s4 = s3
-  4->5 reheater   : constant P  (back to T5)
-  5->6 LP turbine : isentropic  s6 = s5
-  6->1 condenser  : constant P  (reject heat to saturated liquid)
 """
 
 import numpy as np
+import pandas as pd
+import altair as alt
 import streamlit as st
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from CoolProp.CoolProp import PropsSI
 
 FLUID = "Water"
@@ -42,8 +36,7 @@ BLUE  = "#1f9ff2"
 
 
 # ══════════════════════════════════════════════════════════════════
-#  1) THERMODYNAMIC SOLVER
-#     Every state is fixed by exactly TWO independent properties.
+#  1) THERMODYNAMIC SOLVER — each state fixed by TWO properties
 # ══════════════════════════════════════════════════════════════════
 def solve_cycle(P_cond, P_boiler, T3_C, P_reheat, T5_C):
     T3 = T3_C + 273.15
@@ -58,8 +51,8 @@ def solve_cycle(P_cond, P_boiler, T3_C, P_reheat, T5_C):
     # STATE 2 — pump exit, isentropic           (basis: P2, s2 = s1)
     s2 = s1
     T2 = PropsSI("T", "P", P_boiler, "S", s2, FLUID)
-    w_pump = v1 * (P_boiler - P_cond)            # incompressible-pump model
-    h2 = h1 + w_pump                             # textbook approximation
+    w_pump = v1 * (P_boiler - P_cond)
+    h2 = h1 + w_pump
 
     # STATE 3 — HP-turbine inlet                 (basis: P3, T3)
     h3 = PropsSI("H", "P", P_boiler, "T", T3, FLUID)
@@ -80,13 +73,12 @@ def solve_cycle(P_cond, P_boiler, T3_C, P_reheat, T5_C):
     T6 = PropsSI("T", "P", P_cond, "S", s6, FLUID)
     x6 = PropsSI("Q", "P", P_cond, "S", s6, FLUID)
 
-    # ---- energy balances (per unit mass, kJ/kg) ----
-    q_in   = ((h3 - h2) + (h5 - h4)) / 1000      # Eq. 10-12
-    w_turb = ((h3 - h4) + (h5 - h6)) / 1000      # Eq. 10-13
+    q_in   = ((h3 - h2) + (h5 - h4)) / 1000
+    w_turb = ((h3 - h4) + (h5 - h6)) / 1000
     q_out  = (h6 - h1) / 1000
     w_pump_kJ = w_pump / 1000
     w_net  = w_turb - w_pump_kJ
-    eta    = w_net / q_in                         # = 1 - q_out/q_in
+    eta    = w_net / q_in
     moisture = (1 - x6) * 100 if 0 <= x6 <= 1 else 0.0
 
     states = {
@@ -103,7 +95,7 @@ def solve_cycle(P_cond, P_boiler, T3_C, P_reheat, T5_C):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  2) PLANT-SCALE + ECONOMIC KPIs (assumptions are all user inputs)
+#  2) PLANT-SCALE + ECONOMIC KPIs
 # ══════════════════════════════════════════════════════════════════
 def compute_kpis(perf, W_net_MW, eta_boiler, fuel_price, hours_yr, tariff):
     w_net = perf["w_net"]
@@ -111,14 +103,12 @@ def compute_kpis(perf, W_net_MW, eta_boiler, fuel_price, hours_yr, tariff):
     kpi["heat_rate"] = 3600.0 / perf["eta"]
     kpi["ssc"]       = 3600.0 / w_net
     kpi["bwr"]       = perf["w_pump"] / perf["w_turb"]
-
     mdot = W_net_MW * 1000.0 / w_net
     kpi["mdot"]      = mdot
     kpi["Q_in_MW"]   = mdot * perf["q_in"]   / 1000.0
     kpi["Q_out_MW"]  = mdot * perf["q_out"]  / 1000.0
     kpi["W_turb_MW"] = mdot * perf["w_turb"] / 1000.0
     kpi["W_pump_MW"] = mdot * perf["w_pump"] / 1000.0
-
     kpi["Q_fuel_MW"]   = kpi["Q_in_MW"] / eta_boiler
     kpi["fuel_rate"]   = kpi["Q_fuel_MW"] * 3.6 * fuel_price
     kpi["gen_cost"]    = kpi["fuel_rate"] / (W_net_MW * 1000.0)
@@ -129,7 +119,7 @@ def compute_kpis(perf, W_net_MW, eta_boiler, fuel_price, hours_yr, tariff):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  3) PLOTTING
+#  3) DATA FOR THE T-s CHART (pure numpy + CoolProp)
 # ══════════════════════════════════════════════════════════════════
 def closed_dome(n=400):
     """One continuous closed saturation curve: liquid line up, vapor line down."""
@@ -137,19 +127,11 @@ def closed_dome(n=400):
     Ts = np.linspace(273.16, Tc - 0.1, n)
     sf = np.array([PropsSI("S", "T", t, "Q", 0, FLUID) for t in Ts])
     sg = np.array([PropsSI("S", "T", t, "Q", 1, FLUID) for t in Ts])
-    s_dome = np.concatenate([sf, sg[::-1]])
-    T_dome = np.concatenate([Ts, Ts[::-1]])
-    return s_dome, T_dome
+    return np.concatenate([sf, sg[::-1]]), np.concatenate([Ts, Ts[::-1]])
 
 
 def isobar_segments(P, Ta, Tb, n=90):
-    """
-    Split a constant-pressure path into:
-      liquid  : subcooled-liquid heating  Ta -> saturated liquid (blue)
-      rest    : horizontal boiling (sf->sg) + superheat up to Tb (pink)
-    Keeping them separate lets us colour the liquid branch and draw the
-    boiling segment perfectly horizontal inside the dome.
-    """
+    """Split a constant-P path into (liquid branch, boiling+superheat branch)."""
     Pcrit = PropsSI("Pcrit", FLUID)
     liq_s, liq_T, rest_s, rest_T = [], [], [], []
     if P < Pcrit:
@@ -159,8 +141,8 @@ def isobar_segments(P, Ta, Tb, n=90):
         if Ta < Tsat:
             for t in np.linspace(Ta, Tsat - 0.05, max(n // 3, 10)):
                 liq_s.append(PropsSI("S", "P", P, "T", t, FLUID)); liq_T.append(t)
-            liq_s.append(sf); liq_T.append(Tsat)         # end exactly on sat.liquid
-            rest_s += [sf, sg]; rest_T += [Tsat, Tsat]   # horizontal boiling
+            liq_s.append(sf); liq_T.append(Tsat)
+            rest_s += [sf, sg]; rest_T += [Tsat, Tsat]       # horizontal boiling
             vstart = Tsat + 0.05
         else:
             vstart = Ta
@@ -173,54 +155,87 @@ def isobar_segments(P, Ta, Tb, n=90):
     return (np.array(liq_s), np.array(liq_T)), (np.array(rest_s), np.array(rest_T))
 
 
-def plot_ts(states):
+def build_ts_chart(states):
+    """Return an Altair (Streamlit-native) interactive T-s diagram."""
     kk = lambda s: s / 1000.0
     C  = lambda T: T - 273.15
     s = {n: states[n]["s"] for n in states}
     T = {n: states[n]["T"] for n in states}
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    LIQ  = "Compressed liquid (contains h₂)"
+    PATH = "Cycle path"
 
-    # continuous closed saturation dome
-    s_dome, T_dome = closed_dome()
-    ax.plot(kk(s_dome), C(T_dome), "k-", lw=1.3, zorder=2)
+    # ---- saturation dome (own layer, black) ----
+    ds, dT = closed_dome()
+    dome_df = pd.DataFrame({"s": kk(ds), "T": C(dT), "order": range(len(ds))})
 
-    # 1-2 pump
-    ax.plot([kk(s[1]), kk(s[2])], [C(T[1]), C(T[2])], PINK, lw=2.3, zorder=4)
+    # ---- process segments (blue liquid branch + pink rest) ----
+    rows, counter = [], [0]
+    def add(sarr, Tarr, seg, series):
+        for si, Ti in zip(sarr, Tarr):
+            rows.append(dict(s=kk(si), T=C(Ti), seg=seg, series=series, order=counter[0]))
+            counter[0] += 1
 
-    # 2-3 boiler: BLUE compressed-liquid branch (has h2) + PINK boiling/superheat
+    add([s[1], s[2]], [T[1], T[2]], "pump", PATH)                 # 1-2
     (liqS, liqT), (restS, restT) = isobar_segments(states[3]["P"], T[2], T[3])
     if len(liqS):
-        ax.plot(kk(liqS), C(liqT), BLUE, lw=3.2, zorder=5,
-                label="Compressed liquid (contains h₂)")
-    ax.plot(kk(restS), C(restT), PINK, lw=2.3, zorder=4)
-
-    # 3-4 HP turbine
-    ax.plot([kk(s[3]), kk(s[4])], [C(T[3]), C(T[4])], PINK, lw=2.3, zorder=4)
-    # 4-5 reheater (all superheated -> all pink)
+        add(liqS, liqT, "liquid", LIQ)                           # 2 -> sat.liquid (blue)
+    add(restS, restT, "boil_sup", PATH)                          # boiling + superheat
+    add([s[3], s[4]], [T[3], T[4]], "hp", PATH)                  # 3-4
     (_, _), (rS, rT) = isobar_segments(states[4]["P"], T[4], T[5])
-    ax.plot(kk(rS), C(rT), PINK, lw=2.3, zorder=4)
-    # 5-6 LP turbine
-    ax.plot([kk(s[5]), kk(s[6])], [C(T[5]), C(T[6])], PINK, lw=2.3, zorder=4)
-    # 6-1 condenser
-    ax.plot([kk(s[6]), kk(s[1])], [C(T[6]), C(T[1])], PINK, lw=2.3, zorder=4)
+    add(rS, rT, "reheat", PATH)                                  # 4-5
+    add([s[5], s[6]], [T[5], T[6]], "lp", PATH)                  # 5-6
+    add([s[6], s[1]], [T[6], T[1]], "cond", PATH)                # 6-1
+    seg_df = pd.DataFrame(rows)
 
-    # numbered state points (offsets keep 1 & 2 from overlapping)
-    off = {1:(-24,-6), 2:(-24,8), 3:(-8,10), 4:(10,-4), 5:(8,10), 6:(10,-10)}
-    for n in states:
-        ax.plot(kk(s[n]), C(T[n]), "o", color=PINK, ms=7, zorder=6,
-                mec="white", mew=0.8)
-        ax.annotate(str(n), (kk(s[n]), C(T[n])), textcoords="offset points",
-                    xytext=off[n], fontweight="bold", fontsize=12)
+    # ---- state points (with hover tooltips) ----
+    pdf = pd.DataFrame([dict(
+        State=n, s=kk(states[n]["s"]), T=round(C(states[n]["T"]), 1),
+        P=round(states[n]["P"] / 1000, 1),
+        h=round(states[n]["h"] / 1000, 1),
+        sval=round(states[n]["s"] / 1000, 4),
+        x=("—" if states[n]["x"] is None else f"{states[n]['x']:.3f}"),
+    ) for n in states])
 
-    ax.set_xlabel("s  [kJ/kg·K]")
-    ax.set_ylabel("T  [°C]")
-    ax.set_title("T-s Diagram — Ideal Reheat Rankine Cycle")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.margins(x=0.05, y=0.08)
-    fig.tight_layout()
-    return fig
+    # y-axis headroom so labels on the hottest points (e.g. 3 & 5 at 600°C) aren't clipped
+    maxT_C = max(C(states[n]["T"]) for n in states)
+    x_enc = alt.X("s:Q", title="s  [kJ/kg·K]", scale=alt.Scale(zero=False))
+    y_enc = alt.Y("T:Q", title="T  [°C]",
+                  scale=alt.Scale(domain=[-10, maxT_C + 45], nice=False))
+
+    dome = alt.Chart(dome_df).mark_line(color="black", strokeWidth=1.3).encode(
+        x=x_enc, y=y_enc, order="order:Q")
+
+    segs = alt.Chart(seg_df).mark_line(strokeWidth=2.8).encode(
+        x=x_enc, y=y_enc,
+        color=alt.Color("series:N",
+                        scale=alt.Scale(domain=[LIQ, PATH], range=[BLUE, PINK]),
+                        legend=alt.Legend(title="", orient="top-left")),
+        detail="seg:N", order="order:Q")
+
+    pts = alt.Chart(pdf).mark_point(filled=True, size=95, color=PINK,
+                                    stroke="white", strokeWidth=1).encode(
+        x=x_enc, y=y_enc,
+        tooltip=[alt.Tooltip("State:O", title="State"),
+                 alt.Tooltip("P:Q", title="P (kPa)"),
+                 alt.Tooltip("T:Q", title="T (°C)"),
+                 alt.Tooltip("h:Q", title="h (kJ/kg)"),
+                 alt.Tooltip("sval:Q", title="s (kJ/kg·K)"),
+                 alt.Tooltip("x:N", title="quality x")])
+
+    # labels: point 1 goes down-left so it doesn't hide under point 2
+    lab_rest = alt.Chart(pdf[pdf["State"] != 1]).mark_text(
+        dx=12, dy=-10, fontSize=14, fontWeight="bold").encode(
+        x=x_enc, y=y_enc, text="State:O")
+    lab_one = alt.Chart(pdf[pdf["State"] == 1]).mark_text(
+        dx=-13, dy=13, fontSize=14, fontWeight="bold").encode(
+        x=x_enc, y=y_enc, text="State:O")
+
+    chart = (alt.layer(dome, segs, pts, lab_rest, lab_one)
+             .properties(height=470, title="T-s Diagram — Ideal Reheat Rankine Cycle")
+             .configure_view(strokeOpacity=0)
+             .interactive())
+    return chart
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -277,7 +292,6 @@ P_boiler = P_boiler_MPa * 1e6
 P_reheat = P_reheat_MPa * 1e6
 P_cond   = P_cond_kPa  * 1e3
 
-# physical ordering check
 if not (P_cond < P_reheat < P_boiler):
     st.error("Required ordering: condenser < reheat < boiler pressure. Adjust inputs.")
     st.stop()
@@ -289,7 +303,6 @@ except Exception as e:
     st.error(f"Could not solve the cycle at these inputs: {e}")
     st.stop()
 
-# moisture status banner
 if perf["moisture"] > moisture_limit:
     st.warning(f"⚠️ Exit moisture **{perf['moisture']:.1f}%** exceeds the "
                f"{moisture_limit:.1f}% limit — adjust the reheat pressure.")
@@ -317,16 +330,16 @@ with tab_eng:
     b[1].metric("Steam rate (SSC)", f"{kpi['ssc']:.2f} kg/kWh",
                 help="Specific steam consumption = 3600/w_net (kg of steam per kWh).")
     b[2].metric("Mass flow (m-dot)", f"{kpi['mdot']:.1f} kg/s",
-                help="Steam flow needed to reach the target power = Ẇ_net / w_net.")
+                help="Steam flow needed to reach the target power = W_net / w_net.")
     b[3].metric("Boiler duty", f"{kpi['Q_in_MW']:.1f} MW",
-                help="Thermal power the boiler must supply = ṁ·q_in.")
+                help="Thermal power the boiler must supply = m-dot x q_in.")
     c = st.columns(4)
     c[0].metric("Condenser duty", f"{kpi['Q_out_MW']:.1f} MW",
-                help="Heat rejected in the condenser = ṁ·q_out.")
+                help="Heat rejected in the condenser = m-dot x q_out.")
     c[1].metric("Turbine power", f"{kpi['W_turb_MW']:.1f} MW",
-                help="Gross mechanical power from both turbines = ṁ·w_turb.")
+                help="Gross mechanical power from both turbines = m-dot x w_turb.")
     c[2].metric("Pump power", f"{kpi['W_pump_MW']:.2f} MW",
-                help="Power absorbed by the feed pump = ṁ·w_pump.")
+                help="Power absorbed by the feed pump = m-dot x w_pump.")
     c[3].metric("Exit quality x₆", f"{perf['x6']:.3f}",
                 help="Vapor fraction at LP-turbine exit (1 = dry saturated vapor).")
 
@@ -335,14 +348,14 @@ with tab_fin:
     d[0].metric("Fuel firing rate", f"{kpi['Q_fuel_MW']:.1f} MW",
                 help="Fuel thermal power = boiler duty / boiler efficiency.")
     d[1].metric("Fuel cost rate", f"$ {kpi['fuel_rate']:,.0f} /h",
-                help="Hourly fuel cost = Q̇_fuel × 3.6 × fuel price.")
+                help="Hourly fuel cost = Q_fuel x 3.6 x fuel price.")
     d[2].metric("Generation cost (fuel)", f"$ {kpi['gen_cost']:.4f} /kWh",
-                help="Fuel cost per kWh generated = fuel cost rate / Ẇ_net. Fuel only.")
+                help="Fuel cost per kWh generated = fuel cost rate / W_net. Fuel only.")
     d[3].metric("Annual fuel cost", f"$ {kpi['annual_fuel']/1e6:.1f} M/yr",
-                help="Fuel cost rate × operating hours per year.")
+                help="Fuel cost rate x operating hours per year.")
     e = st.columns(4)
     e[0].metric("Annual revenue", f"$ {kpi['revenue']/1e6:.1f} M/yr",
-                help="Ẇ_net × operating hours × electricity tariff.")
+                help="W_net x operating hours x electricity tariff.")
     e[1].metric("Gross margin (fuel)", f"$ {kpi['margin']/1e6:.1f} M/yr",
                 help="Revenue minus annual fuel cost (ignores capital, O&M, labor).")
     e[2].metric("Target power", f"{W_net_MW:.0f} MW",
@@ -356,14 +369,14 @@ with tab_fin:
 st.divider()
 st.subheader("📐 Governing equations & substitutions")
 
-h  = {n: states[n]["h"] / 1000 for n in states}      # kJ/kg
-sK = {n: states[n]["s"] / 1000 for n in states}      # kJ/kg·K
-Tc = {n: states[n]["T"] - 273.15 for n in states}    # degC
+h  = {n: states[n]["h"] / 1000 for n in states}
+sK = {n: states[n]["s"] / 1000 for n in states}
+Tc = {n: states[n]["T"] - 273.15 for n in states}
 v1 = states[1]["v"]
-P1 = P_cond / 1000        # kPa
-P2 = P_boiler / 1000      # kPa
-Prh = P_reheat / 1000     # kPa
-Wkw = W_net_MW * 1000     # kW
+P1 = P_cond / 1000
+P2 = P_boiler / 1000
+Prh = P_reheat / 1000
+Wkw = W_net_MW * 1000
 
 eq_table = f"""
 | Step | Formula | Substitution → Result |
@@ -400,10 +413,10 @@ with st.expander("Click to show / hide the full derivation table", expanded=True
     st.caption("Every value traced from its two fixing properties → steam tables → result. "
                "Minor deviations from the textbook (<0.5%) are steam-table rounding only.")
 
-# ================= 3) T-s Diagram & state points ===================
+# ================= 3) T-s Diagram (Altair, native) & state points =========
 st.divider()
 st.subheader("📈 T-s Diagram & state points")
-left, right = st.columns([1, 1.25])
+left, right = st.columns([1, 1.3])
 
 with left:
     rows = []
@@ -418,8 +431,9 @@ with left:
             "x": "—" if s["x"] is None else f"{s['x']:.3f}",
         })
     st.dataframe(rows, width="stretch", hide_index=True)
-    st.caption("Blue segment on the diagram = compressed-liquid heating (2 → saturated liquid), "
-               "which starts at h₂. The flat line inside the dome is boiling at constant T.")
+    st.caption("Chart is interactive: hover a point for its properties, scroll to zoom, drag to pan. "
+               "Blue = compressed-liquid heating (starts at h₂); the flat line inside the dome is "
+               "constant-temperature boiling.")
 
 with right:
-    st.pyplot(plot_ts(states))
+    st.altair_chart(build_ts_chart(states), use_container_width=True)
