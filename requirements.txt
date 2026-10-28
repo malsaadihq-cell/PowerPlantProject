@@ -1,4 +1,2 @@
 streamlit>=1.50
 CoolProp>=6.6.0
-matplotlib>=3.7
-numpy>=1.24
