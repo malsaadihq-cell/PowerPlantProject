@@ -21,10 +21,6 @@ CYCLE MODEL (6 states)
   6 : wet steam         @ condenser pressure     (LP-turbine exit, isentropic)
 """
 
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import streamlit as st
 from CoolProp.CoolProp import PropsSI
 
@@ -115,77 +111,7 @@ def compute_kpis(perf, W_net_MW, eta_boiler, fuel_price, hours_yr, tariff):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  3) T–s DIAGRAM  — saturation dome + actual process paths
-# ══════════════════════════════════════════════════════════════════
-def _isobar_Ts(P, s_a, s_b, n=80):
-    """Trace a constant-pressure path from entropy s_a to s_b.
-    Sampling on (P, s) automatically follows liquid → two-phase (flat,
-    T = T_sat) → superheat, so boiler / reheat / condenser lines are exact."""
-    out_s, out_T = [], []
-    for s in np.linspace(s_a, s_b, n):
-        try:
-            T = PropsSI("T", "P", P, "S", s, FLUID)
-            out_s.append(s / 1000.0)
-            out_T.append(T - 273.15)
-        except Exception:
-            continue
-    return out_s, out_T
-
-
-def plot_Ts(states, P_cond, P_boiler, P_reheat):
-    """Return a matplotlib T–s figure for the reheat Rankine cycle."""
-    Tc = PropsSI("Tcrit", FLUID)
-
-    # --- saturation dome (sat-liquid branch up, sat-vapor branch down) ---
-    T_dome = np.linspace(274.0, Tc - 0.3, 220)
-    sf, sg, Tf = [], [], []
-    for T in T_dome:
-        try:
-            sf.append(PropsSI("S", "T", T, "Q", 0, FLUID) / 1000.0)
-            sg.append(PropsSI("S", "T", T, "Q", 1, FLUID) / 1000.0)
-            Tf.append(T - 273.15)
-        except Exception:
-            continue
-    dome_s = sf + sg[::-1]
-    dome_T = Tf + Tf[::-1]
-
-    s  = {n: states[n]["s"] for n in states}
-    Tc_ = {n: states[n]["T"] - 273.15 for n in states}
-    RED = "#c81e1e"
-
-    fig, ax = plt.subplots(figsize=(7.2, 5.2))
-    ax.plot(dome_s, dome_T, color="#8a8f98", lw=1.3, label="Saturation dome")
-
-    # 1→2 pump (isentropic, ~vertical)
-    ax.plot([s[1] / 1000, s[2] / 1000], [Tc_[1], Tc_[2]], color=RED, lw=2)
-    # 2→3 boiler (constant pressure)
-    bs, bT = _isobar_Ts(P_boiler, s[2], s[3]); ax.plot(bs, bT, color=RED, lw=2)
-    # 3→4 HP turbine (isentropic)
-    ax.plot([s[3] / 1000, s[4] / 1000], [Tc_[3], Tc_[4]], color=RED, lw=2)
-    # 4→5 reheat (constant pressure)
-    rs, rT = _isobar_Ts(P_reheat, s[4], s[5]); ax.plot(rs, rT, color=RED, lw=2)
-    # 5→6 LP turbine (isentropic)
-    ax.plot([s[5] / 1000, s[6] / 1000], [Tc_[5], Tc_[6]], color=RED, lw=2)
-    # 6→1 condenser (constant pressure)
-    cs, cT = _isobar_Ts(P_cond, s[6], s[1]); ax.plot(cs, cT, color=RED, lw=2,
-                                                     label="Cycle path")
-
-    for n in states:
-        ax.plot(s[n] / 1000, Tc_[n], "o", color="#1f2d3d", ms=6, zorder=5)
-        ax.annotate(str(n), (s[n] / 1000, Tc_[n]), textcoords="offset points",
-                    xytext=(6, 6), fontsize=11, fontweight="bold", color="#1f2d3d")
-
-    ax.set_xlabel("Entropy  s  (kJ/kg·K)")
-    ax.set_ylabel("Temperature  T  (°C)")
-    ax.set_title("T–s Diagram — Ideal Reheat Rankine Cycle")
-    ax.grid(True, ls=":", alpha=0.5)
-    ax.legend(loc="lower right", fontsize=9)
-    fig.tight_layout()
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════════
-#  4) STREAMLIT USER INTERFACE
+#  3) STREAMLIT USER INTERFACE
 # ══════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Reheat Rankine Cycle", page_icon="♨️", layout="wide")
 st.title("♨️ Ideal Reheat Rankine Cycle — Simulator")
@@ -311,22 +237,7 @@ with tab_fin:
     st.caption("Financial figures cover **fuel only** (no capital, O&M, labor, or emissions). "
                "All driven by the sidebar assumptions, so every number is auditable.")
 
-# ========================= 2) T–s diagram ==========================
-st.divider()
-st.subheader("🌡️ T–s Diagram")
-try:
-    fig = plot_Ts(states, P_cond, P_boiler, P_reheat)
-    st.pyplot(fig, use_container_width=True)
-    st.caption(
-        "Saturation dome with the six cycle states. Vertical segments are the "
-        "isentropic pump (1→2) and turbines (3→4, 5→6); the curved/flat segments "
-        "are constant-pressure heat addition in the boiler (2→3) and reheater "
-        "(4→5) and rejection in the condenser (6→1). The flat part inside the dome "
-        "sits at the saturation temperature of that pressure.")
-except Exception as e:
-    st.info(f"T–s diagram unavailable at these inputs: {e}")
-
-# ===== 3) Governing equations & substitutions (ONE collapsible table) =====
+# ===== 2) Governing equations & substitutions (ONE collapsible table) =====
 st.divider()
 st.subheader("📐 Governing equations & substitutions")
 
