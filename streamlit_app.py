@@ -7,9 +7,6 @@
       pip install -r requirements.txt
       streamlit run streamlit_app.py
 
-  The T-s diagram is drawn with Streamlit's native charting engine
-  (Altair / Vega-Lite) — fully interactive (hover, zoom, pan).
-
   Steam properties come from CoolProp (IAPWS-95 formulation), the same
   standard the published steam tables are built on. Differences from
   the textbook (<0.5%) are only due to table rounding.
@@ -25,14 +22,13 @@ CYCLE MODEL (6 states)
 """
 
 import numpy as np
-import pandas as pd
-import altair as alt
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import streamlit as st
 from CoolProp.CoolProp import PropsSI
 
 FLUID = "Water"
-PINK  = "#e3007f"
-BLUE  = "#1f9ff2"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -119,123 +115,73 @@ def compute_kpis(perf, W_net_MW, eta_boiler, fuel_price, hours_yr, tariff):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  3) DATA FOR THE T-s CHART (pure numpy + CoolProp)
+#  3) T–s DIAGRAM  — saturation dome + actual process paths
 # ══════════════════════════════════════════════════════════════════
-def closed_dome(n=400):
-    """One continuous closed saturation curve: liquid line up, vapor line down."""
+def _isobar_Ts(P, s_a, s_b, n=80):
+    """Trace a constant-pressure path from entropy s_a to s_b.
+    Sampling on (P, s) automatically follows liquid → two-phase (flat,
+    T = T_sat) → superheat, so boiler / reheat / condenser lines are exact."""
+    out_s, out_T = [], []
+    for s in np.linspace(s_a, s_b, n):
+        try:
+            T = PropsSI("T", "P", P, "S", s, FLUID)
+            out_s.append(s / 1000.0)
+            out_T.append(T - 273.15)
+        except Exception:
+            continue
+    return out_s, out_T
+
+
+def plot_Ts(states, P_cond, P_boiler, P_reheat):
+    """Return a matplotlib T–s figure for the reheat Rankine cycle."""
     Tc = PropsSI("Tcrit", FLUID)
-    Ts = np.linspace(273.16, Tc - 0.1, n)
-    sf = np.array([PropsSI("S", "T", t, "Q", 0, FLUID) for t in Ts])
-    sg = np.array([PropsSI("S", "T", t, "Q", 1, FLUID) for t in Ts])
-    return np.concatenate([sf, sg[::-1]]), np.concatenate([Ts, Ts[::-1]])
 
+    # --- saturation dome (sat-liquid branch up, sat-vapor branch down) ---
+    T_dome = np.linspace(274.0, Tc - 0.3, 220)
+    sf, sg, Tf = [], [], []
+    for T in T_dome:
+        try:
+            sf.append(PropsSI("S", "T", T, "Q", 0, FLUID) / 1000.0)
+            sg.append(PropsSI("S", "T", T, "Q", 1, FLUID) / 1000.0)
+            Tf.append(T - 273.15)
+        except Exception:
+            continue
+    dome_s = sf + sg[::-1]
+    dome_T = Tf + Tf[::-1]
 
-def isobar_segments(P, Ta, Tb, n=90):
-    """Split a constant-P path into (liquid branch, boiling+superheat branch)."""
-    Pcrit = PropsSI("Pcrit", FLUID)
-    liq_s, liq_T, rest_s, rest_T = [], [], [], []
-    if P < Pcrit:
-        Tsat = PropsSI("T", "P", P, "Q", 0, FLUID)
-        sf = PropsSI("S", "P", P, "Q", 0, FLUID)
-        sg = PropsSI("S", "P", P, "Q", 1, FLUID)
-        if Ta < Tsat:
-            for t in np.linspace(Ta, Tsat - 0.05, max(n // 3, 10)):
-                liq_s.append(PropsSI("S", "P", P, "T", t, FLUID)); liq_T.append(t)
-            liq_s.append(sf); liq_T.append(Tsat)
-            rest_s += [sf, sg]; rest_T += [Tsat, Tsat]       # horizontal boiling
-            vstart = Tsat + 0.05
-        else:
-            vstart = Ta
-        if Tb > Tsat:
-            for t in np.linspace(vstart, Tb, max(n // 2, 12)):
-                rest_s.append(PropsSI("S", "P", P, "T", t, FLUID)); rest_T.append(t)
-    else:
-        for t in np.linspace(Ta, Tb, n):
-            rest_s.append(PropsSI("S", "P", P, "T", t, FLUID)); rest_T.append(t)
-    return (np.array(liq_s), np.array(liq_T)), (np.array(rest_s), np.array(rest_T))
+    s  = {n: states[n]["s"] for n in states}
+    Tc_ = {n: states[n]["T"] - 273.15 for n in states}
+    RED = "#c81e1e"
 
+    fig, ax = plt.subplots(figsize=(7.2, 5.2))
+    ax.plot(dome_s, dome_T, color="#8a8f98", lw=1.3, label="Saturation dome")
 
-def build_ts_chart(states):
-    """Return an Altair (Streamlit-native) interactive T-s diagram."""
-    kk = lambda s: s / 1000.0
-    C  = lambda T: T - 273.15
-    s = {n: states[n]["s"] for n in states}
-    T = {n: states[n]["T"] for n in states}
+    # 1→2 pump (isentropic, ~vertical)
+    ax.plot([s[1] / 1000, s[2] / 1000], [Tc_[1], Tc_[2]], color=RED, lw=2)
+    # 2→3 boiler (constant pressure)
+    bs, bT = _isobar_Ts(P_boiler, s[2], s[3]); ax.plot(bs, bT, color=RED, lw=2)
+    # 3→4 HP turbine (isentropic)
+    ax.plot([s[3] / 1000, s[4] / 1000], [Tc_[3], Tc_[4]], color=RED, lw=2)
+    # 4→5 reheat (constant pressure)
+    rs, rT = _isobar_Ts(P_reheat, s[4], s[5]); ax.plot(rs, rT, color=RED, lw=2)
+    # 5→6 LP turbine (isentropic)
+    ax.plot([s[5] / 1000, s[6] / 1000], [Tc_[5], Tc_[6]], color=RED, lw=2)
+    # 6→1 condenser (constant pressure)
+    cs, cT = _isobar_Ts(P_cond, s[6], s[1]); ax.plot(cs, cT, color=RED, lw=2,
+                                                     label="Cycle path")
 
-    LIQ  = "Compressed liquid (contains h₂)"
-    PATH = "Cycle path"
+    for n in states:
+        ax.plot(s[n] / 1000, Tc_[n], "o", color="#1f2d3d", ms=6, zorder=5)
+        ax.annotate(str(n), (s[n] / 1000, Tc_[n]), textcoords="offset points",
+                    xytext=(6, 6), fontsize=11, fontweight="bold", color="#1f2d3d")
 
-    # ---- saturation dome (own layer, black) ----
-    ds, dT = closed_dome()
-    dome_df = pd.DataFrame({"s": kk(ds), "T": C(dT), "order": range(len(ds))})
-
-    # ---- process segments (blue liquid branch + pink rest) ----
-    rows, counter = [], [0]
-    def add(sarr, Tarr, seg, series):
-        for si, Ti in zip(sarr, Tarr):
-            rows.append(dict(s=kk(si), T=C(Ti), seg=seg, series=series, order=counter[0]))
-            counter[0] += 1
-
-    add([s[1], s[2]], [T[1], T[2]], "pump", PATH)                 # 1-2
-    (liqS, liqT), (restS, restT) = isobar_segments(states[3]["P"], T[2], T[3])
-    if len(liqS):
-        add(liqS, liqT, "liquid", LIQ)                           # 2 -> sat.liquid (blue)
-    add(restS, restT, "boil_sup", PATH)                          # boiling + superheat
-    add([s[3], s[4]], [T[3], T[4]], "hp", PATH)                  # 3-4
-    (_, _), (rS, rT) = isobar_segments(states[4]["P"], T[4], T[5])
-    add(rS, rT, "reheat", PATH)                                  # 4-5
-    add([s[5], s[6]], [T[5], T[6]], "lp", PATH)                  # 5-6
-    add([s[6], s[1]], [T[6], T[1]], "cond", PATH)                # 6-1
-    seg_df = pd.DataFrame(rows)
-
-    # ---- state points (with hover tooltips) ----
-    pdf = pd.DataFrame([dict(
-        State=n, s=kk(states[n]["s"]), T=round(C(states[n]["T"]), 1),
-        P=round(states[n]["P"] / 1000, 1),
-        h=round(states[n]["h"] / 1000, 1),
-        sval=round(states[n]["s"] / 1000, 4),
-        x=("—" if states[n]["x"] is None else f"{states[n]['x']:.3f}"),
-    ) for n in states])
-
-    # y-axis headroom so labels on the hottest points (e.g. 3 & 5 at 600°C) aren't clipped
-    maxT_C = max(C(states[n]["T"]) for n in states)
-    x_enc = alt.X("s:Q", title="s  [kJ/kg·K]", scale=alt.Scale(zero=False))
-    y_enc = alt.Y("T:Q", title="T  [°C]",
-                  scale=alt.Scale(domain=[-10, maxT_C + 45], nice=False))
-
-    dome = alt.Chart(dome_df).mark_line(color="black", strokeWidth=1.3).encode(
-        x=x_enc, y=y_enc, order="order:Q")
-
-    segs = alt.Chart(seg_df).mark_line(strokeWidth=2.8).encode(
-        x=x_enc, y=y_enc,
-        color=alt.Color("series:N",
-                        scale=alt.Scale(domain=[LIQ, PATH], range=[BLUE, PINK]),
-                        legend=alt.Legend(title="", orient="top-left")),
-        detail="seg:N", order="order:Q")
-
-    pts = alt.Chart(pdf).mark_point(filled=True, size=95, color=PINK,
-                                    stroke="white", strokeWidth=1).encode(
-        x=x_enc, y=y_enc,
-        tooltip=[alt.Tooltip("State:O", title="State"),
-                 alt.Tooltip("P:Q", title="P (kPa)"),
-                 alt.Tooltip("T:Q", title="T (°C)"),
-                 alt.Tooltip("h:Q", title="h (kJ/kg)"),
-                 alt.Tooltip("sval:Q", title="s (kJ/kg·K)"),
-                 alt.Tooltip("x:N", title="quality x")])
-
-    # labels: point 1 goes down-left so it doesn't hide under point 2
-    lab_rest = alt.Chart(pdf[pdf["State"] != 1]).mark_text(
-        dx=12, dy=-10, fontSize=14, fontWeight="bold").encode(
-        x=x_enc, y=y_enc, text="State:O")
-    lab_one = alt.Chart(pdf[pdf["State"] == 1]).mark_text(
-        dx=-13, dy=13, fontSize=14, fontWeight="bold").encode(
-        x=x_enc, y=y_enc, text="State:O")
-
-    chart = (alt.layer(dome, segs, pts, lab_rest, lab_one)
-             .properties(height=470, title="T-s Diagram — Ideal Reheat Rankine Cycle")
-             .configure_view(strokeOpacity=0)
-             .interactive())
-    return chart
+    ax.set_xlabel("Entropy  s  (kJ/kg·K)")
+    ax.set_ylabel("Temperature  T  (°C)")
+    ax.set_title("T–s Diagram — Ideal Reheat Rankine Cycle")
+    ax.grid(True, ls=":", alpha=0.5)
+    ax.legend(loc="lower right", fontsize=9)
+    fig.tight_layout()
+    return fig
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -365,7 +311,22 @@ with tab_fin:
     st.caption("Financial figures cover **fuel only** (no capital, O&M, labor, or emissions). "
                "All driven by the sidebar assumptions, so every number is auditable.")
 
-# ===== 2) Governing equations & substitutions (ONE collapsible table) =====
+# ========================= 2) T–s diagram ==========================
+st.divider()
+st.subheader("🌡️ T–s Diagram")
+try:
+    fig = plot_Ts(states, P_cond, P_boiler, P_reheat)
+    st.pyplot(fig, use_container_width=True)
+    st.caption(
+        "Saturation dome with the six cycle states. Vertical segments are the "
+        "isentropic pump (1→2) and turbines (3→4, 5→6); the curved/flat segments "
+        "are constant-pressure heat addition in the boiler (2→3) and reheater "
+        "(4→5) and rejection in the condenser (6→1). The flat part inside the dome "
+        "sits at the saturation temperature of that pressure.")
+except Exception as e:
+    st.info(f"T–s diagram unavailable at these inputs: {e}")
+
+# ===== 3) Governing equations & substitutions (ONE collapsible table) =====
 st.divider()
 st.subheader("📐 Governing equations & substitutions")
 
@@ -413,27 +374,18 @@ with st.expander("Click to show / hide the full derivation table", expanded=True
     st.caption("Every value traced from its two fixing properties → steam tables → result. "
                "Minor deviations from the textbook (<0.5%) are steam-table rounding only.")
 
-# ================= 3) T-s Diagram (Altair, native) & state points =========
+# ========================= 3) State points table =========================
 st.divider()
-st.subheader("📈 T-s Diagram & state points")
-left, right = st.columns([1, 1.3])
-
-with left:
-    rows = []
-    for n in sorted(states):
-        s = states[n]
-        rows.append({
-            "State": n,
-            "P (kPa)": round(s["P"] / 1000, 2),
-            "T (degC)": round(s["T"] - 273.15, 2),
-            "h (kJ/kg)": round(s["h"] / 1000, 2),
-            "s (kJ/kg.K)": round(s["s"] / 1000, 4),
-            "x": "—" if s["x"] is None else f"{s['x']:.3f}",
-        })
-    st.dataframe(rows, width="stretch", hide_index=True)
-    st.caption("Chart is interactive: hover a point for its properties, scroll to zoom, drag to pan. "
-               "Blue = compressed-liquid heating (starts at h₂); the flat line inside the dome is "
-               "constant-temperature boiling.")
-
-with right:
-    st.altair_chart(build_ts_chart(states), use_container_width=True)
+st.subheader("📋 State points")
+rows = []
+for n in sorted(states):
+    s = states[n]
+    rows.append({
+        "State": n,
+        "P (kPa)": round(s["P"] / 1000, 2),
+        "T (degC)": round(s["T"] - 273.15, 2),
+        "h (kJ/kg)": round(s["h"] / 1000, 2),
+        "s (kJ/kg.K)": round(s["s"] / 1000, 4),
+        "x": "—" if s["x"] is None else f"{s['x']:.3f}",
+    })
+st.dataframe(rows, width="stretch", hide_index=True)
